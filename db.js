@@ -3,19 +3,39 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 /* ============================================================
-   Kyzen NextGen — Database layer (SQLite via better-sqlite3)
+   Kyzen NextGen — Database layer
+
    Tables:
-     keys            — long-lived (until expiry) key records
-     claim_sessions  — short-lived (5 min) verification sessions
+     keys
+       - long-lived 24h keys
+
+     claim_sessions
+       - temporary Link4m verification sessions
+       - 10 minute TTL
+       - identified by browser identifier
    ============================================================ */
 
-const DB_PATH = resolve(process.env.DATABASE_URL || "./data/kyzen.db");
-mkdirSync(dirname(DB_PATH), { recursive: true });
+const DB_PATH = resolve(
+  process.env.DATABASE_URL ||
+  "./data/kyzen.db"
+);
 
-const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
+mkdirSync(
+  dirname(DB_PATH),
+  { recursive: true }
+);
 
-/* ---------- Schema ---------- */
+const db =
+  new Database(DB_PATH);
+
+db.pragma(
+  "journal_mode = WAL"
+);
+
+/* ============================================================
+   SCHEMA
+   ============================================================ */
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS keys (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,155 +43,510 @@ CREATE TABLE IF NOT EXISTS keys (
   identifier  TEXT    NOT NULL,
   createdAt   INTEGER NOT NULL,
   expiresAt   INTEGER NOT NULL,
-  status      TEXT    NOT NULL DEFAULT 'active'   -- active | expired
+  status      TEXT    NOT NULL DEFAULT 'active'
 );
-CREATE INDEX IF NOT EXISTS idx_keys_identifier ON keys(identifier);
-CREATE INDEX IF NOT EXISTS idx_keys_key         ON keys(key);
+
+CREATE INDEX IF NOT EXISTS
+idx_keys_identifier
+ON keys(identifier);
+
+CREATE INDEX IF NOT EXISTS
+idx_keys_key
+ON keys(key);
+
 
 CREATE TABLE IF NOT EXISTS claim_sessions (
-  id          TEXT    PRIMARY KEY,               -- token (claim token)
+  id          TEXT    PRIMARY KEY,
   identifier  TEXT    NOT NULL,
   createdAt   INTEGER NOT NULL,
   expiresAt   INTEGER NOT NULL,
   verified    INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_identifier ON claim_sessions(identifier);
+
+CREATE INDEX IF NOT EXISTS
+idx_sessions_identifier
+ON claim_sessions(identifier);
+
+CREATE INDEX IF NOT EXISTS
+idx_sessions_identifier_verified
+ON claim_sessions(identifier, verified);
 `);
 
-/* ---------- Prepared statements ---------- */
+/* ============================================================
+   PREPARED STATEMENTS
+   ============================================================ */
+
 const stmts = {
-  insertKey: db.prepare(
-    `INSERT INTO keys (key, identifier, createdAt, expiresAt, status)
-     VALUES (@key, @identifier, @createdAt, @expiresAt, @status)`
-  ),
-  findActiveKeyByIdentifier: db.prepare(
-    `SELECT * FROM keys WHERE identifier = ? AND status = 'active' ORDER BY expiresAt DESC LIMIT 1`
-  ),
-  findKeyByKey: db.prepare(`SELECT * FROM keys WHERE key = ?`),
 
-  expireOldKeys: db.prepare(
-    `UPDATE keys SET status = 'expired'
-     WHERE status = 'active' AND expiresAt <= ?`
-  ),
+  /* ---------- KEYS ---------- */
 
-  insertSession: db.prepare(
-    `INSERT INTO claim_sessions (id, identifier, createdAt, expiresAt, verified)
-     VALUES (@id, @identifier, @createdAt, @expiresAt, @verified)`
-  ),
-  findSession: db.prepare(`SELECT * FROM claim_sessions WHERE id = ?`),
-  markSessionVerified: db.prepare(`UPDATE claim_sessions SET verified = 1 WHERE id = ?`),
-  purgeSessions: db.prepare(`DELETE FROM claim_sessions WHERE expiresAt <= ?`),
+  insertKey:
+    db.prepare(`
+      INSERT INTO keys (
+        key,
+        identifier,
+        createdAt,
+        expiresAt,
+        status
+      )
+      VALUES (
+        @key,
+        @identifier,
+        @createdAt,
+        @expiresAt,
+        @status
+      )
+    `),
 
-  countKeys: db.prepare(`SELECT COUNT(*) AS c FROM keys`),
-  countActiveKeys: db.prepare(`SELECT COUNT(*) AS c FROM keys WHERE status = 'active'`),
-  countSessions: db.prepare(`SELECT COUNT(*) AS c FROM claim_sessions`),
+  findActiveKeyByIdentifier:
+    db.prepare(`
+      SELECT *
+      FROM keys
+      WHERE identifier = ?
+        AND status = 'active'
+      ORDER BY expiresAt DESC
+      LIMIT 1
+    `),
+
+  findKeyByKey:
+    db.prepare(`
+      SELECT *
+      FROM keys
+      WHERE key = ?
+    `),
+
+  expireOldKeys:
+    db.prepare(`
+      UPDATE keys
+      SET status = 'expired'
+      WHERE status = 'active'
+        AND expiresAt <= ?
+    `),
+
+  /* ---------- SESSIONS ---------- */
+
+  insertSession:
+    db.prepare(`
+      INSERT INTO claim_sessions (
+        id,
+        identifier,
+        createdAt,
+        expiresAt,
+        verified
+      )
+      VALUES (
+        @id,
+        @identifier,
+        @createdAt,
+        @expiresAt,
+        @verified
+      )
+    `),
+
+  findSession:
+    db.prepare(`
+      SELECT *
+      FROM claim_sessions
+      WHERE id = ?
+    `),
+
+  findPendingSessionByIdentifier:
+    db.prepare(`
+      SELECT *
+      FROM claim_sessions
+      WHERE identifier = ?
+        AND verified = 0
+        AND expiresAt > ?
+      ORDER BY createdAt DESC
+      LIMIT 1
+    `),
+
+  findVerifiedSessionByIdentifier:
+    db.prepare(`
+      SELECT *
+      FROM claim_sessions
+      WHERE identifier = ?
+        AND verified = 1
+        AND expiresAt > ?
+      ORDER BY createdAt DESC
+      LIMIT 1
+    `),
+
+  markSessionVerified:
+    db.prepare(`
+      UPDATE claim_sessions
+      SET verified = 1
+      WHERE id = ?
+    `),
+
+  deleteSession:
+    db.prepare(`
+      DELETE FROM claim_sessions
+      WHERE id = ?
+    `),
+
+  purgeSessions:
+    db.prepare(`
+      DELETE FROM claim_sessions
+      WHERE expiresAt <= ?
+    `),
+
+  /* ---------- STATS ---------- */
+
+  countKeys:
+    db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM keys
+    `),
+
+  countActiveKeys:
+    db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM keys
+      WHERE status = 'active'
+    `),
+
+  countSessions:
+    db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM claim_sessions
+    `),
 };
 
-/* ---------- Helpers ---------- */
-const now = () => Date.now();
+/* ============================================================
+   TIME
+   ============================================================ */
 
-/** Mark keys past their expiry as expired. */
+const now = () =>
+  Date.now();
+
+/* ============================================================
+   EXPIRED KEYS
+   ============================================================ */
+
 export function sweepExpiredKeys() {
-  const r = stmts.expireOldKeys.run(now());
+  const r =
+    stmts.expireOldKeys.run(
+      now()
+    );
+
   return r.changes;
 }
 
-/** Delete claim sessions older than their expiry (auto-cleanup ~5 min). */
+/* ============================================================
+   EXPIRED SESSIONS
+   ============================================================ */
+
 export function purgeOldSessions() {
-  const r = stmts.purgeSessions.run(now());
+  const r =
+    stmts.purgeSessions.run(
+      now()
+    );
+
   return r.changes;
 }
 
-/**
- * Return the still-valid key for an identifier, or null.
- * Side effect: if the stored active key is actually past expiry, mark it expired.
- */
-export function getActiveKey(identifier) {
-  const row = stmts.findActiveKeyByIdentifier.get(identifier);
-  if (!row) return null;
-  if (row.expiresAt <= now()) {
-    stmts.expireOldKeys.run(now());
+/* ============================================================
+   ACTIVE KEY
+   ============================================================ */
+
+export function getActiveKey(
+  identifier
+) {
+  const row =
+    stmts
+      .findActiveKeyByIdentifier
+      .get(identifier);
+
+  if (!row) {
     return null;
   }
+
+  if (
+    row.expiresAt <=
+    now()
+  ) {
+    stmts.expireOldKeys.run(
+      now()
+    );
+
+    return null;
+  }
+
   return row;
 }
 
-/** Insert a new key record (24h by default). */
-export function createKeyRecord(key, identifier, durationMs = 24 * 60 * 60 * 1000) {
-  const t = now();
+/* ============================================================
+   CREATE KEY
+   ============================================================ */
+
+export function createKeyRecord(
+  key,
+  identifier,
+  durationMs =
+    24 * 60 * 60 * 1000
+) {
+  const t =
+    now();
+
   stmts.insertKey.run({
     key,
     identifier,
     createdAt: t,
-    expiresAt: t + durationMs,
-    status: "active",
+    expiresAt:
+      t + durationMs,
+    status:
+      "active",
   });
-  return stmts.findKeyByKey.get(key);
+
+  return stmts
+    .findKeyByKey
+    .get(key);
 }
 
-/** Verify a key string from Roblox. Returns {valid, status, expiresAt?}. */
-export function verifyKey(key) {
-  if (!key || typeof key !== "string") return { valid: false, status: "invalid" };
-  const row = stmts.findKeyByKey.get(key);
-  if (!row) return { valid: false, status: "invalid" };
-  if (row.expiresAt <= now()) {
-    // lazy-expire
-    if (row.status === "active") stmts.expireOldKeys.run(now());
-    return { valid: false, status: "expired" };
+/* ============================================================
+   VERIFY KEY
+   ============================================================ */
+
+export function verifyKey(
+  key
+) {
+  if (
+    !key ||
+    typeof key !==
+      "string"
+  ) {
+    return {
+      valid: false,
+      status: "invalid",
+    };
   }
-  return { valid: true, status: "active", expiresAt: row.expiresAt };
+
+  const row =
+    stmts
+      .findKeyByKey
+      .get(key);
+
+  if (!row) {
+    return {
+      valid: false,
+      status: "invalid",
+    };
+  }
+
+  if (
+    row.expiresAt <=
+    now()
+  ) {
+    if (
+      row.status ===
+      "active"
+    ) {
+      stmts.expireOldKeys.run(
+        now()
+      );
+    }
+
+    return {
+      valid: false,
+      status: "expired",
+    };
+  }
+
+  return {
+    valid: true,
+    status: "active",
+    expiresAt:
+      row.expiresAt,
+  };
 }
 
-/* ---------- Claim sessions ---------- */
-export function createSession(id, identifier, ttlMs = 5 * 60 * 1000) {
-  const t = now();
+/* ============================================================
+   CREATE SESSION
+   ============================================================ */
+
+export function createSession(
+  id,
+  identifier,
+  ttlMs =
+    10 * 60 * 1000
+) {
+  const t =
+    now();
+
   stmts.insertSession.run({
     id,
     identifier,
     createdAt: t,
-    expiresAt: t + ttlMs,
+    expiresAt:
+      t + ttlMs,
     verified: 0,
   });
-  return stmts.findSession.get(id);
+
+  return stmts
+    .findSession
+    .get(id);
 }
 
-export function getSession(id) {
-  const row = stmts.findSession.get(id);
-  if (!row) return null;
-  if (row.expiresAt <= now()) return null; // expired session
+/* ============================================================
+   GET SESSION BY ID
+   ============================================================ */
+
+export function getSession(
+  id
+) {
+  const row =
+    stmts
+      .findSession
+      .get(id);
+
+  if (!row) {
+    return null;
+  }
+
+  if (
+    row.expiresAt <=
+    now()
+  ) {
+    return null;
+  }
+
   return row;
 }
 
-export function markSessionVerified(id) {
-  return stmts.markSessionVerified.run(id);
+/* ============================================================
+   GET PENDING SESSION BY IDENTIFIER
+   ============================================================ */
+
+export function getPendingSessionByIdentifier(
+  identifier
+) {
+  return (
+    stmts
+      .findPendingSessionByIdentifier
+      .get(
+        identifier,
+        now()
+      ) ||
+    null
+  );
 }
 
-/* ---------- Admin / stats ---------- */
+/* ============================================================
+   GET VERIFIED SESSION BY IDENTIFIER
+   ============================================================ */
+
+export function getVerifiedSessionByIdentifier(
+  identifier
+) {
+  return (
+    stmts
+      .findVerifiedSessionByIdentifier
+      .get(
+        identifier,
+        now()
+      ) ||
+    null
+  );
+}
+
+/* ============================================================
+   MARK VERIFIED
+   ============================================================ */
+
+export function markSessionVerified(
+  id
+) {
+  return stmts
+    .markSessionVerified
+    .run(id);
+}
+
+/* ============================================================
+   DELETE SESSION
+   ============================================================ */
+
+export function deleteSession(
+  id
+) {
+  return stmts
+    .deleteSession
+    .run(id);
+}
+
+/* ============================================================
+   STATS
+   ============================================================ */
+
 export function stats() {
   sweepExpiredKeys();
   purgeOldSessions();
+
   return {
-    keys_total: stmts.countKeys.get().c,
-    keys_active: stmts.countActiveKeys.get().c,
-    sessions: stmts.countSessions.get().c,
-    time: now(),
+    keys_total:
+      stmts.countKeys
+        .get()
+        .c,
+
+    keys_active:
+      stmts.countActiveKeys
+        .get()
+        .c,
+
+    sessions:
+      stmts.countSessions
+        .get()
+        .c,
+
+    time:
+      now(),
   };
 }
 
-export function listActiveKeys(limit = 100) {
+/* ============================================================
+   LIST ACTIVE KEYS
+   ============================================================ */
+
+export function listActiveKeys(
+  limit = 100
+) {
   return db
-    .prepare(`SELECT key, identifier, createdAt, expiresAt, status FROM keys WHERE status='active' ORDER BY expiresAt DESC LIMIT ?`)
+    .prepare(`
+      SELECT
+        key,
+        identifier,
+        createdAt,
+        expiresAt,
+        status
+      FROM keys
+      WHERE status = 'active'
+      ORDER BY expiresAt DESC
+      LIMIT ?
+    `)
     .all(limit);
 }
 
-/* Run a periodic sweep every 60s for hygiene */
-setInterval(() => {
-  try {
-    sweepExpiredKeys();
-    purgeOldSessions();
-  } catch (e) {
-    console.error("[db] sweep error:", e.message);
-  }
-}, 60_000);
+/* ============================================================
+   PERIODIC CLEANUP
+   ============================================================ */
+
+setInterval(
+  () => {
+    try {
+      sweepExpiredKeys();
+      purgeOldSessions();
+    } catch (e) {
+      console.error(
+        "[db] sweep error:",
+        e.message
+      );
+    }
+  },
+  60_000
+);
+
+/* ============================================================
+   EXPORT
+   ============================================================ */
 
 export default db;
