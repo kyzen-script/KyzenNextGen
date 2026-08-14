@@ -21,6 +21,7 @@ import {
   identifierFromFingerprint,
   newFingerprint,
   generateKyzenKey,
+  generateClaimToken,
 } from "./crypto.js";
 
 /* ============================================================
@@ -721,67 +722,6 @@ app.get(
     return res.redirect(LINK4M_FIXED_URL);
   }
 );
-/* ============================================================
-   Generate session ID locally.
-
-   We don't expose this ID in the URL.
-   ============================================================ */
-
-function cryptoRandomSessionId() {
-  const bytes =
-    new Uint8Array(24);
-
-  /*
-   * Node crypto is already used by
-   * crypto.js, but we intentionally
-   * avoid changing crypto.js.
-   *
-   * Use randomUUID-style timestamp
-   * + random process data.
-   */
-  return (
-    `${Date.now().toString(36)}-` +
-    Math.random()
-      .toString(36)
-      .slice(2) +
-    "-" +
-    Math.random()
-      .toString(36)
-      .slice(2) +
-    "-" +
-    Array.from(bytes)
-      .map(() =>
-        Math.floor(
-          Math.random() * 16
-        ).toString(16)
-      )
-      .join("")
-  );
-}
-
-/* ============================================================
-   GET /claim-ok
-
-   Link4m fixed destination:
-   https://kyzennextgen-production.up.railway.app/claim-ok
-
-   Browser sends kz_fp automatically.
-
-   identifier
-       ↓
-   pending session
-       ↓
-   verified
-       ↓
-   /claim
-
-   NOTE:
-   This endpoint relies on the Link4m
-   fixed redirect flow. If Link4m provides
-   a signed callback in the future, that
-   can be added here for stronger proof.
-   ============================================================ */
-
 app.get(
   "/claim-ok",
   (req, res) => {
@@ -1055,7 +995,6 @@ app.post(
 /* ============================================================
    GET /api/verify
    ============================================================ */
-
 app.get(
   "/api/verify",
   (req, res) => {
