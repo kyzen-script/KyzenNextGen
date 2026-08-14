@@ -675,22 +675,11 @@ app.get(
   "/get-key",
   rateLimit(10),
   (req, res) => {
-    const {
-      identifier,
-    } = resolveIdentifier(
-      req,
-      res
-    );
+    const { identifier } = resolveIdentifier(req, res);
 
     purgeOldSessions();
 
-    /*
-     * If the browser already owns
-     * an active 24h key, don't force
-     * another Link4m verification.
-     */
-    const existing =
-      getActiveKey(identifier);
+    const existing = getActiveKey(identifier);
 
     if (existing) {
       return res.redirect(
@@ -698,10 +687,6 @@ app.get(
       );
     }
 
-    /*
-     * Make sure a fixed Link4m URL
-     * exists in Railway environment.
-     */
     if (!LINK4M_FIXED_URL) {
       console.error(
         "[kyzen] LINK4M_FIXED_URL is not configured."
@@ -716,18 +701,11 @@ app.get(
         );
     }
 
-    /*
-     * Don't create multiple pending
-     * sessions for the same browser.
-     */
     const pending =
-      getPendingSessionByIdentifier(
-        identifier
-      );
+      getPendingSessionByIdentifier(identifier);
 
     if (!pending) {
-      const sessionId =
-        cryptoRandomSessionId();
+      const sessionId = generateClaimToken();
 
       createSession(
         sessionId,
@@ -740,17 +718,9 @@ app.get(
       );
     }
 
-    /*
-     * IMPORTANT:
-     * Always redirect to ONE fixed
-     * Link4m short URL.
-     */
-    return res.redirect(
-      LINK4M_FIXED_URL
-    );
+    return res.redirect(LINK4M_FIXED_URL);
   }
 );
-
 /* ============================================================
    Generate session ID locally.
 
